@@ -1,19 +1,34 @@
 #include "../nvme.h"
+#include "dram.h"
+
+static int femu_rdma_init_backend(SsdDramBackend *b);
 
 /* Coperd: FEMU Memory Backend (mbe) for emulated SSD */
 
 int init_dram_backend(SsdDramBackend **mbe, int64_t nbytes)
 {
+    fprintf(stderr, "FEMU DRAM backend init ENTERED\n");
+    fflush(stderr);
     SsdDramBackend *b = *mbe = g_malloc0(sizeof(SsdDramBackend));
 
     b->size = nbytes;
     b->logical_space = g_malloc0(nbytes);
+
+    b->enable_rdma = 1; 
 
     if (mlock(b->logical_space, nbytes) == -1) {
         femu_err("Failed to pin the memory backend to the host DRAM\n");
         g_free(b->logical_space);
         abort();
     }
+
+    if (b->enable_rdma) {
+    if (femu_rdma_init_backend(b) != 0) {
+        femu_err("RDMA init failed, falling back to DMA\n");
+        b->enable_rdma = 0;
+    }
+}
+
 
     return 0;
 }
@@ -65,6 +80,73 @@ int backend_rw(SsdDramBackend *b, QEMUSGList *qsg, uint64_t *lbal, bool is_write
     }
 
     qemu_sglist_destroy(qsg);
+
+    return 0;
+}
+
+
+static int femu_rdma_init_backend(SsdDramBackend *b)
+{
+
+    fprintf(stderr, "[RDMA] init start\n");
+    fflush(stderr);
+
+
+    struct ibv_device **dev_list;
+    int num_devs;
+
+    dev_list = ibv_get_device_list(&num_devs);
+    if (!dev_list || num_devs == 0) {
+        femu_err("No RDMA devices found\n");
+        return -1;
+    }
+
+    b->rdma.ctx = ibv_open_device(dev_list[0]);
+    fprintf(stderr, "[RDMA] device opened\n");
+
+    ibv_free_device_list(dev_list);
+
+    if (!b->rdma.ctx)
+        return -1;
+
+    b->rdma.pd = ibv_alloc_pd(b->rdma.ctx);
+    fprintf(stderr, "[RDMA] PD allocated\n");
+
+    if (!b->rdma.pd)
+        return -1;
+
+    b->rdma.cq = ibv_create_cq(b->rdma.ctx, 16, NULL, NULL, 0);
+    if (!b->rdma.cq)
+        return -1;
+
+    /* create qp1 and qp2 */
+
+    /* REGISTER BACKEND DRAM BUFFER */
+    b->mr_backend = ibv_reg_mr(
+        b->rdma.pd,
+        b->logical_space,
+        b->size,
+        IBV_ACCESS_LOCAL_WRITE |
+        IBV_ACCESS_REMOTE_READ |
+        IBV_ACCESS_REMOTE_WRITE
+    );
+
+    fprintf(stderr,
+    "[RDMA] MR registered addr=%p size=%ld lkey=%u rkey=%u\n",
+    b->logical_space,
+    b->size,
+    b->mr_backend->lkey,
+    b->mr_backend->rkey
+);
+
+
+    if (!b->mr_backend) {
+        femu_err("Failed to register backend MR\n");
+        return -1;
+    }
+
+    b->rdma.initialized = 1;
+
 
     return 0;
 }
