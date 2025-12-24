@@ -38,6 +38,7 @@ sudo apt install -y \
   python3 \
   python3-pip
 
+
 # 4. Verify pkg-config
 echo "[CHECK] pkg-config"
 which pkg-config
@@ -56,7 +57,8 @@ fi
 # 6. Shell reminder
 echo
 echo "=== DONE ==="
-echo "IMPORTANT:"
-echo "  - Always use bash (not sh)"
-echo "  - Open a new terminal or run: source ~/.bashrc"
-echo "  - Next step: clone FEMU-rdma and build"
+
+#FIX DNS
+sudo resolvectl dns eno1 8.8.8.8 1.1.1.1
+sudo resolvectl domain eno1 ~.
+resolvectl status

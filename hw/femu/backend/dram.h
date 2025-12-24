@@ -1,5 +1,6 @@
 #ifndef __FEMU_MEM_BACKEND
 #define __FEMU_MEM_BACKEND
+#define FEMU_BOUNCE_SIZE (128 * 1024) 
 
 #include <infiniband/verbs.h>
 #include <stdint.h>
@@ -28,6 +29,10 @@ typedef struct SsdDramBackend {
     FemuRdmaCtx rdma;
 
     struct ibv_mr *mr_backend;
+
+    void          *bounce_buf;
+    size_t         bounce_size;
+    struct ibv_mr *mr_bounce;
 
 } SsdDramBackend;
 
