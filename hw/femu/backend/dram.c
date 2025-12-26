@@ -3,6 +3,8 @@
 
 static int rdma_init_backend(SsdDramBackend *b);
 static int rdma_qp_connect_loopback(SsdDramBackend *b, uint8_t port_num);
+static int rdma_write_bounce_to_backend(SsdDramBackend *b, uint64_t backend_off, size_t len);
+static int rdma_read_backend_to_bounce(SsdDramBackend *b, uint64_t backend_off, size_t len);
 
 /* Coperd: FEMU Memory Backend (mbe) for emulated SSD */
 
@@ -66,6 +68,14 @@ void free_dram_backend(SsdDramBackend *b)
 
 int backend_rw(SsdDramBackend *b, QEMUSGList *qsg, uint64_t *lbal, bool is_write)
 {
+
+    fprintf(stderr,
+        "[RDMA-CHECK] enable_rdma=%d initialized=%d is_write=%d\n",
+        b->enable_rdma,
+        b->rdma.initialized,
+        is_write);
+
+
     int sg_cur_index = 0;
     dma_addr_t sg_cur_byte = 0;
     dma_addr_t cur_addr, cur_len;
@@ -78,6 +88,23 @@ int backend_rw(SsdDramBackend *b, QEMUSGList *qsg, uint64_t *lbal, bool is_write
         cur_addr = qsg->sg[sg_cur_index].base + sg_cur_byte;
         cur_len = qsg->sg[sg_cur_index].len - sg_cur_byte;
 
+        // checks on bounce
+        if (cur_len > b->bounce_size)
+        {
+            fprintf(stderr,
+                    "[RDMA] BUG: cur_len=%zu > bounce_size=%zu\n",
+                    cur_len, b->bounce_size);
+            return -1;
+        }
+
+        if (mb_oft + cur_len > (uint64_t)b->size)
+        {
+            fprintf(stderr,
+                    "[RDMA] BUG: backend OOB: off=%lu len=%zu size=%ld\n",
+                    (unsigned long)mb_oft, cur_len, (long)b->size);
+            return -1;
+        }
+
         if (is_write)
         {
             /* Guest → Bounce */
@@ -87,12 +114,34 @@ int backend_rw(SsdDramBackend *b, QEMUSGList *qsg, uint64_t *lbal, bool is_write
                           MEMTXATTRS_UNSPECIFIED);
 
             /* Bounce → Backend */
-            memcpy(backend + mb_oft, bounce, cur_len);
+            if (b->enable_rdma)
+            {
+                if (rdma_write_bounce_to_backend(b, mb_oft, cur_len) != 0)
+                {
+                    return -1;
+                }
+            }
+            else
+            {
+                memcpy(backend + mb_oft, bounce, cur_len);
+            }
+
+            
         }
         else
         {
             /* Backend → Bounce */
-            memcpy(bounce, backend + mb_oft, cur_len);
+            if (b->enable_rdma)
+            {
+                if (rdma_read_backend_to_bounce(b, mb_oft, cur_len) != 0)
+                {
+                    return -1;
+                }
+            }
+            else
+            {
+                memcpy(bounce, backend + mb_oft, cur_len);
+            }
 
             /* Bounce → Guest */
             dma_memory_rw(qsg->as, cur_addr,
@@ -230,7 +279,6 @@ static int rdma_init_backend(SsdDramBackend *b)
             IBV_ACCESS_REMOTE_READ |
             IBV_ACCESS_REMOTE_WRITE);
 
-
     if (!b->mr_bounce)
     {
         femu_err("Failed to register bounce MR\n");
@@ -264,32 +312,33 @@ static int qp_to_rtr(struct ibv_qp *qp,
                      uint32_t remote_psn,
                      uint8_t port_num,
                      int is_roce,
-                     uint16_t dlid,              
-                     int sgid_index,             
-                     union ibv_gid dgid)         
+                     uint16_t dlid,
+                     int sgid_index,
+                     union ibv_gid dgid)
 {
     struct ibv_qp_attr attr;
     memset(&attr, 0, sizeof(attr));
 
-    attr.qp_state           = IBV_QPS_RTR;
-    attr.path_mtu           = IBV_MTU_1024;     
-    attr.dest_qp_num        = remote_qpn;
-    attr.rq_psn             = remote_psn;
+    attr.qp_state = IBV_QPS_RTR;
+    attr.path_mtu = IBV_MTU_1024;
+    attr.dest_qp_num = remote_qpn;
+    attr.rq_psn = remote_psn;
     attr.max_dest_rd_atomic = 1;
-    attr.min_rnr_timer      = 12;
+    attr.min_rnr_timer = 12;
 
-    attr.ah_attr.is_global     = is_roce ? 1 : 0;
-    attr.ah_attr.dlid          = is_roce ? 0 : dlid;
-    attr.ah_attr.sl            = 0;
+    attr.ah_attr.is_global = is_roce ? 1 : 0;
+    attr.ah_attr.dlid = is_roce ? 0 : dlid;
+    attr.ah_attr.sl = 0;
     attr.ah_attr.src_path_bits = 0;
-    attr.ah_attr.port_num      = port_num;
+    attr.ah_attr.port_num = port_num;
 
-    if (is_roce) {
-        attr.ah_attr.grh.dgid           = dgid;
-        attr.ah_attr.grh.sgid_index     = sgid_index;
-        attr.ah_attr.grh.hop_limit      = 1;
-        attr.ah_attr.grh.traffic_class  = 0;
-        attr.ah_attr.grh.flow_label     = 0;
+    if (is_roce)
+    {
+        attr.ah_attr.grh.dgid = dgid;
+        attr.ah_attr.grh.sgid_index = sgid_index;
+        attr.ah_attr.grh.hop_limit = 1;
+        attr.ah_attr.grh.traffic_class = 0;
+        attr.ah_attr.grh.flow_label = 0;
     }
 
     int flags = IBV_QP_STATE |
@@ -302,7 +351,6 @@ static int qp_to_rtr(struct ibv_qp *qp,
 
     return ibv_modify_qp(qp, &attr, flags);
 }
-
 
 static int qp_to_rts(struct ibv_qp *qp, uint32_t local_psn)
 {
@@ -323,38 +371,45 @@ static int qp_to_rts(struct ibv_qp *qp, uint32_t local_psn)
 
 static int rdma_qp_connect_loopback(SsdDramBackend *b, uint8_t port_num)
 {
-    if (!b || !b->rdma.ctx || !b->rdma.qp1 || !b->rdma.qp2) {
+    if (!b || !b->rdma.ctx || !b->rdma.qp1 || !b->rdma.qp2)
+    {
         femu_err("RDMA connect called before QPs/ctx exist\n");
         return -1;
     }
 
     struct ibv_port_attr port_attr;
-    if (ibv_query_port(b->rdma.ctx, port_num, &port_attr) != 0) {
+    if (ibv_query_port(b->rdma.ctx, port_num, &port_attr) != 0)
+    {
         femu_err("ibv_query_port failed\n");
         return -1;
     }
 
-    if (port_attr.state != IBV_PORT_ACTIVE) {
+    if (port_attr.state != IBV_PORT_ACTIVE)
+    {
         femu_err("RDMA port not ACTIVE (state=%d)\n", port_attr.state);
         return -1;
     }
 
     int is_roce = (port_attr.link_layer == IBV_LINK_LAYER_ETHERNET);
-    uint16_t lid = port_attr.lid; 
+    uint16_t lid = port_attr.lid;
 
-   
     int sgid_index = 0;
     union ibv_gid gid;
     memset(&gid, 0, sizeof(gid));
 
-    if (is_roce) {
-        if (ibv_query_gid(b->rdma.ctx, port_num, sgid_index, &gid) != 0) {
+    if (is_roce)
+    {
+        if (ibv_query_gid(b->rdma.ctx, port_num, sgid_index, &gid) != 0)
+        {
             femu_err("ibv_query_gid failed (port=%u sgid_index=%d)\n", port_num, sgid_index);
             return -1;
         }
-    } else {
-       
-        if (lid == 0) {
+    }
+    else
+    {
+
+        if (lid == 0)
+        {
             femu_err("[WARN] IB link_layer but LID=0; check fabric/SM\n");
         }
     }
@@ -365,11 +420,13 @@ static int rdma_qp_connect_loopback(SsdDramBackend *b, uint8_t port_num)
     uint32_t psn2 = lrand48() & 0xffffff;
 
     // INIT for both
-    if (qp_to_init(b->rdma.qp1, port_num) != 0) {
+    if (qp_to_init(b->rdma.qp1, port_num) != 0)
+    {
         femu_err("qp1 -> INIT failed\n");
         return -1;
     }
-    if (qp_to_init(b->rdma.qp2, port_num) != 0) {
+    if (qp_to_init(b->rdma.qp2, port_num) != 0)
+    {
         femu_err("qp2 -> INIT failed\n");
         return -1;
     }
@@ -382,7 +439,8 @@ static int rdma_qp_connect_loopback(SsdDramBackend *b, uint8_t port_num)
                   is_roce,
                   lid,
                   sgid_index,
-                  gid) != 0) {
+                  gid) != 0)
+    {
         femu_err("qp1 -> RTR failed\n");
         return -1;
     }
@@ -394,17 +452,20 @@ static int rdma_qp_connect_loopback(SsdDramBackend *b, uint8_t port_num)
                   is_roce,
                   lid,
                   sgid_index,
-                  gid) != 0) {
+                  gid) != 0)
+    {
         femu_err("qp2 -> RTR failed\n");
         return -1;
     }
 
     // RTS
-    if (qp_to_rts(b->rdma.qp1, psn1) != 0) {
+    if (qp_to_rts(b->rdma.qp1, psn1) != 0)
+    {
         femu_err("qp1 -> RTS failed\n");
         return -1;
     }
-    if (qp_to_rts(b->rdma.qp2, psn2) != 0) {
+    if (qp_to_rts(b->rdma.qp2, psn2) != 0)
+    {
         femu_err("qp2 -> RTS failed\n");
         return -1;
     }
@@ -422,4 +483,122 @@ static int rdma_qp_connect_loopback(SsdDramBackend *b, uint8_t port_num)
     fflush(stderr);
 
     return 0;
+}
+
+static int rdma_poll_one_wc(struct ibv_cq *cq, uint64_t expect_wr_id)
+{
+    struct ibv_wc wc;
+    int ne;
+
+    do
+    {
+        ne = ibv_poll_cq(cq, 1, &wc);
+    } while (ne == 0);
+
+    if (ne < 0)
+    {
+        femu_err("ibv_poll_cq failed ne=%d\n", ne);
+        return -1;
+    }
+    if (wc.status != IBV_WC_SUCCESS)
+    {
+        femu_err("RDMA WC error: status=%s (%d) vendor_err=%u wr_id=%lu\n",
+                 ibv_wc_status_str(wc.status), wc.status, wc.vendor_err,
+                 (unsigned long)wc.wr_id);
+        return -1;
+    }
+    if (wc.wr_id != expect_wr_id)
+    {
+        femu_err("RDMA WC mismatch: got wr_id=%lu expect=%lu\n",
+                 (unsigned long)wc.wr_id, (unsigned long)expect_wr_id);
+        return -1;
+    }
+    return 0;
+}
+
+static int rdma_write_bounce_to_backend(SsdDramBackend *b,
+                                        uint64_t backend_off,
+                                        size_t len)
+{
+    if (!b->enable_rdma || !b->rdma.initialized)
+    {
+        memcpy((uint8_t *)b->logical_space + backend_off, b->bounce_buf, len);
+        return 0;
+    }
+
+    struct ibv_sge sge = {
+        .addr = (uintptr_t)b->bounce_buf,
+        .length = (uint32_t)len,
+        .lkey = b->mr_bounce->lkey,
+    };
+
+    struct ibv_send_wr wr, *bad = NULL;
+    memset(&wr, 0, sizeof(wr));
+
+    uint64_t wr_id = (b->rdma_wr_seq++ << 1) | 1; // WRITE tag
+    wr.wr_id = wr_id;
+
+    fprintf(stderr, "[RDMA] WRITE off=%lu len=%zu wr_id=%lu\n",
+            backend_off, len, wr_id);
+
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_RDMA_WRITE;
+    wr.send_flags = IBV_SEND_SIGNALED; /* wait for completion */
+
+    wr.wr.rdma.remote_addr = (uintptr_t)((uint8_t *)b->logical_space + backend_off);
+    wr.wr.rdma.rkey = b->mr_backend->rkey;
+
+    if (ibv_post_send(b->rdma.qp1, &wr, &bad) != 0)
+    {
+        fprintf(stderr, "[FEMU] Err: "
+                        "ibv_post_send(WRITE) failed\n");
+        return -1;
+    }
+
+    return rdma_poll_one_wc(b->rdma.cq, wr_id);
+}
+
+static int rdma_read_backend_to_bounce(SsdDramBackend *b,
+                                       uint64_t backend_off,
+                                       size_t len)
+{
+    if (!b->enable_rdma || !b->rdma.initialized)
+    {
+        memcpy(b->bounce_buf, (uint8_t *)b->logical_space + backend_off, len);
+        return 0;
+    }
+
+    struct ibv_sge sge = {
+        .addr = (uintptr_t)b->bounce_buf,
+        .length = (uint32_t)len,
+        .lkey = b->mr_bounce->lkey,
+    };
+
+    struct ibv_send_wr wr, *bad = NULL;
+    memset(&wr, 0, sizeof(wr));
+
+    uint64_t wr_id = (b->rdma_wr_seq++ << 1) | 0; // READ tag
+    wr.wr_id = wr_id;
+
+    fprintf(stderr, "[RDMA] READ off=%lu len=%zu wr_id=%lu\n",
+            backend_off, len, wr_id);
+
+
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_RDMA_READ;
+    wr.send_flags = IBV_SEND_SIGNALED; /* bounce is valid before DMA to guest */
+
+    wr.wr.rdma.remote_addr = (uintptr_t)((uint8_t *)b->logical_space + backend_off);
+    wr.wr.rdma.rkey = b->mr_backend->rkey;
+
+    if (ibv_post_send(b->rdma.qp1, &wr, &bad) != 0)
+    {
+        fprintf(stderr, "[FEMU] Err: "
+                        "ibv_post_send(READ) failed\n");
+        return -1;
+    }
+
+    return rdma_poll_one_wc(b->rdma.cq, wr_id);
 }

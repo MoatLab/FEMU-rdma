@@ -34,6 +34,8 @@ typedef struct SsdDramBackend {
     size_t         bounce_size;
     struct ibv_mr *mr_bounce;
 
+    uint64_t rdma_wr_seq;
+
 } SsdDramBackend;
 
 int init_dram_backend(SsdDramBackend **mbe, int64_t nbytes);
