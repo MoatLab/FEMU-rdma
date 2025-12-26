@@ -178,6 +178,13 @@ int backend_rw(SsdDramBackend *b, QEMUSGList *qsg, uint64_t *lbal, bool is_write
         {
             assert(0);
         }
+
+        if ((b->rdma.rdma_write_cnt & 0xFF) == 0)
+        {
+            fprintf(stderr, "[RDMA] writes=%lu reads=%lu\n",
+                    b->rdma.rdma_write_cnt,
+                    b->rdma.rdma_read_cnt);
+        }
     }
 
     qemu_sglist_destroy(qsg);
@@ -556,7 +563,13 @@ static int rdma_write_bounce_to_backend(SsdDramBackend *b,
         return -1;
     }
 
-    return rdma_poll_one_wc(b->rdma.cq, wr_id);
+    int ret = rdma_poll_one_wc(b->rdma.cq, wr_id);
+    if (ret == 0)
+    {
+        b->rdma.rdma_write_cnt++;
+    }
+
+    return ret;
 }
 
 static int rdma_read_backend_to_bounce(SsdDramBackend *b,
@@ -600,5 +613,11 @@ static int rdma_read_backend_to_bounce(SsdDramBackend *b,
         return -1;
     }
 
-    return rdma_poll_one_wc(b->rdma.cq, wr_id);
+    int ret = rdma_poll_one_wc(b->rdma.cq, wr_id);
+    if (ret == 0)
+    {
+        b->rdma.rdma_read_cnt++;
+    }
+
+    return ret;
 }

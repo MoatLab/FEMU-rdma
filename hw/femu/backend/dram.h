@@ -15,6 +15,9 @@ typedef struct FemuRdmaCtx {
 
     int initialized;
 
+    uint64_t rdma_write_cnt;
+    uint64_t rdma_read_cnt;
+
 } FemuRdmaCtx;
 
 
