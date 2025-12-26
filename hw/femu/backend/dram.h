@@ -4,6 +4,7 @@
 
 #include <infiniband/verbs.h>
 #include <stdint.h>
+#include "../nvme.h"
 
 typedef struct FemuRdmaCtx {
     struct ibv_context *ctx;
@@ -43,7 +44,6 @@ typedef struct SsdDramBackend {
 
 int init_dram_backend(SsdDramBackend **mbe, int64_t nbytes);
 void free_dram_backend(SsdDramBackend *);
-
 int backend_rw(SsdDramBackend *, QEMUSGList *, uint64_t *, bool);
 
 #endif
